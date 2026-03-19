@@ -1,6 +1,5 @@
 import os
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 from supabase import create_client
 
@@ -16,39 +15,65 @@ LOOKBACK_DAYS = 150
 
 
 # =========================
-# STEP 1: FETCH UNIVERSE
+# GET LATEST AVAILABLE DATE
+# =========================
+def get_latest_date():
+    res = supabase.table("stock_52w") \
+        .select("date") \
+        .order("date", desc=True) \
+        .limit(1) \
+        .execute()
+
+    if not res.data:
+        return None
+
+    return res.data[0]["date"]
+
+
+# =========================
+# FETCH UNIVERSE
 # =========================
 def fetch_universe():
-    today = datetime.today().date().isoformat()
+    latest_date = get_latest_date()
+
+    if not latest_date:
+        print("No data available in stock_52w")
+        return pd.DataFrame(), None
+
+    print("Using date:", latest_date)
 
     query = supabase.table("stock_52w") \
         .select("*") \
-        .eq("date", today) \
-        .gt("close", 0) \
+        .eq("date", latest_date) \
         .execute()
 
     df = pd.DataFrame(query.data)
 
-    if df.empty:
-        return df
+    print("Raw rows fetched:", len(df))
 
-    # Apply filters in Python (more flexible than SQL)
+    if df.empty:
+        return df, latest_date
+
+    # ===== FILTER (balanced) =====
     df = df[
         (df["close"] > df["sma50"]) &
         (df["sma50"] > df["sma200"]) &
-        (df["pct_from_high"] >= -12) &
-        (df["pct_from_low"] >= 25) &
-        (df["volume_ma20"] > 100000)
+        (df["pct_from_high"] >= -15) &
+        (df["volume_ma20"] > 50000)
     ]
 
-    return df
+    print("Filtered universe:", len(df))
+
+    return df, latest_date
 
 
 # =========================
-# STEP 2: FETCH PRICE DATA
+# FETCH PRICE DATA
 # =========================
-def fetch_price_data(ticker):
-    start_date = (datetime.today() - timedelta(days=LOOKBACK_DAYS)).date().isoformat()
+def fetch_price_data(ticker, latest_date):
+    start_date = (
+        datetime.strptime(latest_date, "%Y-%m-%d") - timedelta(days=LOOKBACK_DAYS)
+    ).date().isoformat()
 
     query = supabase.table("stock_prices_daily") \
         .select("*") \
@@ -66,7 +91,7 @@ def fetch_price_data(ticker):
 
 
 # =========================
-# STEP 3: SWING DETECTION
+# SWING DETECTION
 # =========================
 def find_swings(df, window=5):
     highs, lows = [], []
@@ -85,7 +110,7 @@ def find_swings(df, window=5):
 
 
 # =========================
-# STEP 4: BUILD CONTRACTIONS
+# CONTRACTIONS
 # =========================
 def calculate_contractions(highs, lows):
     drops = []
@@ -102,21 +127,17 @@ def calculate_contractions(highs, lows):
 
 
 # =========================
-# STEP 5: VALIDATE VCP
+# VALIDATE VCP
 # =========================
 def is_valid_vcp(drops):
     if len(drops) < 3:
         return False
 
-    for i in range(len(drops) - 1):
-        if drops[i] <= drops[i + 1]:
-            return False
-
-    return True
+    return all(drops[i] > drops[i + 1] for i in range(len(drops) - 1))
 
 
 # =========================
-# STEP 6: TIGHT RANGE
+# TIGHT RANGE
 # =========================
 def check_tight_range(df):
     recent = df.tail(10)
@@ -133,34 +154,28 @@ def check_tight_range(df):
 
 
 # =========================
-# STEP 7: SCORING
+# SCORING
 # =========================
 def calculate_score(row, drops, valid_vcp, tight_range, volume_ratio):
     score = 0
 
-    # Trend
     if row["close"] > row["sma50"] > row["sma200"]:
         score += 20
 
-    # Position
     if row["pct_from_high"] >= -5:
         score += 20
     elif row["pct_from_high"] >= -10:
         score += 15
 
-    # Contraction
     if valid_vcp:
         score += 25
 
-    # Volume
     if volume_ratio < 0.6:
         score += 15
 
-    # Tightness
     if tight_range:
         score += 10
 
-    # Prior move
     if row["pct_from_low"] > 50:
         score += 10
 
@@ -168,12 +183,12 @@ def calculate_score(row, drops, valid_vcp, tight_range, volume_ratio):
 
 
 # =========================
-# STEP 8: PROCESS ONE STOCK
+# PROCESS STOCK
 # =========================
-def process_stock(row):
+def process_stock(row, latest_date):
     ticker = row["ticker"]
 
-    df = fetch_price_data(ticker)
+    df = fetch_price_data(ticker, latest_date)
     if df is None:
         return None
 
@@ -192,7 +207,7 @@ def process_stock(row):
     score = calculate_score(row, drops, valid_vcp, tight_range, volume_ratio)
 
     return {
-        "date": datetime.today().date().isoformat(),
+        "date": latest_date,
         "ticker": ticker,
         "exchange": row["exchange"],
 
@@ -214,24 +229,27 @@ def process_stock(row):
 
 
 # =========================
-# STEP 9: UPSERT RESULTS
+# UPSERT
 # =========================
 def upsert_results(results):
     if not results:
+        print("No results to store.")
         return
 
     supabase.table("vcp_candidates").upsert(results).execute()
+    print(f"Stored {len(results)} results.")
 
 
 # =========================
-# MAIN RUNNER
+# MAIN
 # =========================
 def run_vcp_engine():
     print("Fetching universe...")
-    universe = fetch_universe()
+
+    universe, latest_date = fetch_universe()
 
     if universe.empty:
-        print("No stocks found.")
+        print("No stocks found after filtering.")
         return
 
     results = []
@@ -240,20 +258,22 @@ def run_vcp_engine():
 
     for _, row in universe.iterrows():
         try:
-            res = process_stock(row)
+            res = process_stock(row, latest_date)
             if res:
                 results.append(res)
         except Exception as e:
             print(f"Error processing {row['ticker']}: {e}")
 
-    print(f"Storing {len(results)} results...")
     upsert_results(results)
 
     print("VCP Engine completed.")
 
 
 # =========================
-# ENTRY POINT
+# ENTRY
 # =========================
 if __name__ == "__main__":
-    run_vcp_engine()
+    try:
+        run_vcp_engine()
+    except Exception as e:
+        print("Fatal error:", e)
