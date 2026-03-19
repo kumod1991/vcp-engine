@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import math
+import numpy as np
 from datetime import datetime, timedelta
 from supabase import create_client
 
@@ -12,16 +13,30 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-LOOKBACK_DAYS = 120   # reduced
-PROCESS_WINDOW = 80   # core optimization
+LOOKBACK_DAYS = 120
+PROCESS_WINDOW = 80
 
 
 # =========================
-# CLEAN VALUES
+# SANITIZE (CRITICAL FIX)
 # =========================
 def clean(v):
-    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+    if v is None:
         return None
+
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return None
+
+    if isinstance(v, np.bool_):
+        return bool(v)
+
+    if isinstance(v, np.integer):
+        return int(v)
+
+    if isinstance(v, np.floating):
+        return float(v)
+
     return v
 
 
@@ -64,7 +79,7 @@ def get_latest_date():
 
 
 # =========================
-# FETCH FILTERED PRICE DATA
+# FETCH PRICE DATA (BATCHED)
 # =========================
 def fetch_price_data(tickers, latest_date):
     start_date = (
@@ -189,9 +204,8 @@ def run():
         print("No price data")
         return
 
-    # SORT ONCE (IMPORTANT)
+    # SORT ONCE
     price_df = price_df.sort_values(["ticker", "date"])
-
     grouped = dict(tuple(price_df.groupby("ticker")))
 
     results = []
@@ -204,7 +218,7 @@ def run():
         if ticker not in grouped:
             continue
 
-        # 🔥 EARLY FILTERS (BIG SPEED WIN)
+        # EARLY FILTERS (performance boost)
         if row["pct_from_high"] is None or row["pct_from_high"] < -15:
             continue
 
@@ -240,15 +254,15 @@ def run():
             "exchange": row["exchange"],
             "vcp_score": int(s),
             "category": "IDEAL" if s >= 80 else "DEVELOPING",
-            "contractions": len(drops),
+            "contractions": int(len(drops)),
             "contraction_pattern": " → ".join([f"{d}%" for d in drops[:4]]),
-            "pct_from_high": row["pct_from_high"],
-            "base_depth": row["pct_from_low"],
-            "volume_ratio": round(vol_ratio, 2),
-            "volume_dryup": vol_ratio < 0.6,
-            "tight_range": tight,
-            "near_pivot": row["pct_from_high"] >= -10,
-            "breakout_level": df["high"].tail(20).max(),
+            "pct_from_high": float(row["pct_from_high"]),
+            "base_depth": float(row["pct_from_low"]),
+            "volume_ratio": float(round(vol_ratio, 2)),
+            "volume_dryup": bool(vol_ratio < 0.6),
+            "tight_range": bool(tight),
+            "near_pivot": bool(row["pct_from_high"] >= -10),
+            "breakout_level": float(df["high"].tail(20).max()),
         }))
 
     if results:
