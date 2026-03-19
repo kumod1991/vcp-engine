@@ -13,32 +13,26 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-LOOKBACK_DAYS = 120
-PROCESS_WINDOW = 80
+LOOKBACK_DAYS = 150
+PROCESS_WINDOW = 100
 
 
 # =========================
-# SANITIZE (CRITICAL)
+# SANITIZE
 # =========================
 def clean(v):
     if v is None:
         return None
-
     if isinstance(v, float):
         if math.isnan(v) or math.isinf(v):
             return None
-
     if isinstance(v, np.bool_):
         return bool(v)
-
     if isinstance(v, np.integer):
         return int(v)
-
     if isinstance(v, np.floating):
         return float(v)
-
     return v
-
 
 def sanitize(d):
     return {k: clean(v) for k, v in d.items()}
@@ -49,16 +43,13 @@ def sanitize(d):
 # =========================
 def fetch_universe():
     all_rows, offset, limit = [], 0, 1000
-
     while True:
         res = supabase.table("stock_52w") \
             .select("*") \
             .range(offset, offset + limit - 1) \
             .execute()
-
         if not res.data:
             break
-
         all_rows.extend(res.data)
         offset += limit
 
@@ -89,8 +80,6 @@ def fetch_price_data(tickers, latest_date):
     all_rows = []
     batch_size = 200
 
-    print("Fetching price data...")
-
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
 
@@ -104,17 +93,34 @@ def fetch_price_data(tickers, latest_date):
             all_rows.extend(res.data)
 
     df = pd.DataFrame(all_rows)
-
     print("Price rows:", len(df))
     return df
 
 
 # =========================
-# SWING DETECTION
+# CORE LOGIC
 # =========================
+
+def prior_uptrend(df):
+    if len(df) < 100:
+        return False
+    past = df.iloc[-100:-50]
+    recent = df.iloc[-50:]
+    return recent["close"].mean() > past["close"].mean() * 1.2
+
+
+def base_near_high(row):
+    return row["pct_from_high"] >= -15
+
+
+def ma_alignment(row):
+    return (
+        row["close"] > row["sma50"] > row["sma150"] > row["sma200"]
+    )
+
+
 def find_swings(df, window=5):
     highs, lows = [], []
-
     for i in range(window, len(df) - window):
         h = df["high"].iloc[i]
         l = df["low"].iloc[i]
@@ -128,68 +134,62 @@ def find_swings(df, window=5):
     return highs, lows
 
 
-# =========================
-# CONTRACTIONS
-# =========================
 def contractions(highs, lows):
     drops = []
-
     for i in range(min(len(highs), len(lows)) - 1):
         h = highs[i][1]
         l = lows[i][1]
-
         if h > 0:
             drops.append(round((h - l) / h * 100, 2))
-
     return drops
 
 
-# =========================
-# RELAXED VCP LOGIC (KEY FIX)
-# =========================
 def valid_vcp(drops):
-    if len(drops) < 2:
+    if len(drops) < 3:
         return False
 
-    improving = sum(drops[i] > drops[i+1] for i in range(len(drops)-1))
+    improving = all(drops[i] > drops[i+1] for i in range(len(drops)-1))
 
-    return improving >= (len(drops) - 2)
+    if not improving:
+        violations = sum(drops[i] <= drops[i+1] for i in range(len(drops)-1))
+        if violations > 1:
+            return False
+
+    if drops[0] < 8:
+        return False
+
+    if drops[-1] > 12:
+        return False
+
+    return True
 
 
-def tight_range(df):
-    r = df.tail(10)
-    h, l = r["high"].max(), r["low"].min()
-    return h > 0 and ((h - l) / h * 100 < 8)
+def volume_dryup(df):
+    recent = df.tail(10)
+    avg_recent = recent["volume"].mean()
+    avg_prior = df.tail(40).head(30)["volume"].mean()
+
+    return avg_recent < avg_prior * 0.7
 
 
-# =========================
-# SCORE (RELAXED)
-# =========================
-def score(row, drops, tight, vol_ratio):
-    s = 0
+def tight_pivot(df):
+    recent = df.tail(5)
+    high = recent["high"].max()
+    low = recent["low"].min()
+    return (high - low) / high * 100 < 5
 
-    if row["close"] > row["sma50"] > row["sma200"]:
-        s += 20
+
+def score(row, drops):
+    s = 50
+    s += max(0, 20 - drops[-1])
 
     if row["pct_from_high"] >= -5:
-        s += 20
-    elif row["pct_from_high"] >= -10:
-        s += 15
-    elif row["pct_from_high"] >= -20:
         s += 10
 
-    s += 30  # VCP weight increased
-
-    if vol_ratio < 0.6:
-        s += 15
-
-    if tight:
+    if row["pct_from_low"] > 60:
         s += 10
 
-    if row["pct_from_low"] > 50:
-        s += 10
-
-    return s
+    return min(s, 100)
 
 
 # =========================
@@ -200,21 +200,14 @@ def run():
     universe = fetch_universe()
 
     if universe.empty:
-        print("No stocks found")
         return
 
     latest_date = get_latest_date()
     print("Using date:", latest_date)
 
     tickers = universe["ticker"].dropna().unique().tolist()
-
     price_df = fetch_price_data(tickers, latest_date)
 
-    if price_df.empty:
-        print("No price data")
-        return
-
-    # SORT ONCE
     price_df = price_df.sort_values(["ticker", "date"])
     grouped = dict(tuple(price_df.groupby("ticker")))
 
@@ -228,16 +221,21 @@ def run():
         if ticker not in grouped:
             continue
 
-        # RELAXED EARLY FILTER
-        if row["pct_from_high"] is None or row["pct_from_high"] < -25:
+        df_full = grouped[ticker]
+
+        if len(df_full) < 120:
             continue
 
-        if not (row["close"] and row["sma50"] and row["close"] > row["sma50"]):
+        df = df_full.tail(PROCESS_WINDOW)
+
+        # --- Filters ---
+        if not prior_uptrend(df_full):
             continue
 
-        df = grouped[ticker].tail(PROCESS_WINDOW)
+        if not base_near_high(row):
+            continue
 
-        if len(df) < 60:
+        if not ma_alignment(row):
             continue
 
         highs, lows = find_swings(df)
@@ -246,37 +244,38 @@ def run():
         if not valid_vcp(drops):
             continue
 
-        tight = tight_range(df)
-
-        vol_ratio = (
-            row["volume"] / row["volume_ma20"]
-            if row["volume_ma20"] and row["volume_ma20"] > 0
-            else 1
-        )
-
-        s = score(row, drops, tight, vol_ratio)
-
-        if s < 40:
+        if not volume_dryup(df):
             continue
+
+        if not tight_pivot(df):
+            continue
+
+        s = score(row, drops)
 
         results.append(sanitize({
             "ticker": ticker,
             "exchange": row["exchange"],
             "vcp_score": int(s),
-            "category": "IDEAL" if s >= 80 else "DEVELOPING",
+            "category": "IDEAL",
             "contractions": int(len(drops)),
             "contraction_pattern": " → ".join([f"{d}%" for d in drops[:4]]),
             "pct_from_high": float(row["pct_from_high"]),
             "base_depth": float(row["pct_from_low"]),
-            "volume_ratio": float(round(vol_ratio, 2)),
-            "volume_dryup": bool(vol_ratio < 0.6),
-            "tight_range": bool(tight),
-            "near_pivot": bool(row["pct_from_high"] >= -10),
+            "volume_dryup": True,
+            "tight_range": True,
+            "near_pivot": True,
             "breakout_level": float(df["high"].tail(20).max()),
+            "detected_at": datetime.utcnow().isoformat()
         }))
 
+    # =========================
+    # SNAPSHOT OVERWRITE
+    # =========================
+    print("Clearing previous VCP data...")
+    supabase.table("vcp_candidates").delete().neq("ticker", "").execute()
+
     if results:
-        supabase.table("vcp_candidates").upsert(results).execute()
+        supabase.table("vcp_candidates").insert(results).execute()
 
     print(f"Stored {len(results)} results")
     print("VCP Engine completed.")
