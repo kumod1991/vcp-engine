@@ -45,7 +45,7 @@ def get_latest_date():
 
 
 # =========================
-# FETCH UNIVERSE (RELAXED)
+# FETCH FULL UNIVERSE
 # =========================
 def fetch_universe():
     latest_date = get_latest_date()
@@ -63,18 +63,7 @@ def fetch_universe():
 
     df = pd.DataFrame(res.data)
 
-    print("Raw rows:", len(df))
-
-    if df.empty:
-        return df, latest_date
-
-    # 🔥 RELAXED FILTER (do not over-filter here)
-    df = df[
-        (df["close"] > df["sma50"]) &
-        (df["volume_ma20"] > 20000)
-    ]
-
-    print("Filtered universe:", len(df))
+    print("Universe size:", len(df))
 
     return df, latest_date
 
@@ -122,7 +111,7 @@ def find_swings(df, window=5):
 
 
 # =========================
-# CONTRACTION CALCULATION
+# CONTRACTIONS
 # =========================
 def calculate_contractions(highs, lows):
     drops = []
@@ -146,11 +135,10 @@ def is_valid_vcp(drops):
 
 
 # =========================
-# TIGHT RANGE CHECK
+# TIGHT RANGE
 # =========================
 def check_tight_range(df):
     recent = df.tail(10)
-
     high = recent["high"].max()
     low = recent["low"].min()
 
@@ -193,6 +181,10 @@ def calculate_score(row, drops, valid_vcp, tight_range, volume_ratio):
 # PROCESS STOCK
 # =========================
 def process_stock(row, latest_date):
+    # Light sanity filter (avoid junk)
+    if not (row["close"] and row["sma50"] and row["close"] > row["sma50"]):
+        return None
+
     df = fetch_price_data(row["ticker"], latest_date)
     if df is None:
         return None
@@ -202,11 +194,11 @@ def process_stock(row, latest_date):
 
     valid_vcp = is_valid_vcp(drops)
     if not valid_vcp:
-        return None  # key filter
+        return None
 
     tight = check_tight_range(df)
 
-    # safe volume ratio
+    # Safe volume ratio
     if row["volume_ma20"] and row["volume_ma20"] > 0:
         vol_ratio = row["volume"] / row["volume_ma20"]
     else:
@@ -214,8 +206,8 @@ def process_stock(row, latest_date):
 
     score = calculate_score(row, drops, valid_vcp, tight, vol_ratio)
 
-    if score < 60:
-        return None  # final filter
+    if score < 50:
+        return None
 
     category = "IDEAL" if score >= 80 else "DEVELOPING"
 
@@ -258,7 +250,7 @@ def run_vcp_engine():
     universe, latest_date = fetch_universe()
 
     if universe.empty:
-        print("No stocks after filtering.")
+        print("No stocks available.")
         return
 
     print(f"Processing {len(universe)} stocks...")
