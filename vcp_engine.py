@@ -21,11 +21,9 @@ LOOKBACK_DAYS = 150
 def clean_value(val):
     if val is None:
         return None
-
     if isinstance(val, float):
         if math.isnan(val) or math.isinf(val):
             return None
-
     return val
 
 
@@ -34,7 +32,7 @@ def sanitize_record(record):
 
 
 # =========================
-# GET LATEST DATE
+# GET LATEST AVAILABLE DATE
 # =========================
 def get_latest_date():
     res = supabase.table("stock_52w") \
@@ -43,42 +41,37 @@ def get_latest_date():
         .limit(1) \
         .execute()
 
-    if not res.data:
-        return None
-
-    return res.data[0]["date"]
+    return res.data[0]["date"] if res.data else None
 
 
 # =========================
-# FETCH UNIVERSE
+# FETCH UNIVERSE (RELAXED)
 # =========================
 def fetch_universe():
     latest_date = get_latest_date()
 
     if not latest_date:
-        print("No data available in stock_52w")
+        print("No data in stock_52w")
         return pd.DataFrame(), None
 
     print("Using date:", latest_date)
 
-    query = supabase.table("stock_52w") \
+    res = supabase.table("stock_52w") \
         .select("*") \
         .eq("date", latest_date) \
         .execute()
 
-    df = pd.DataFrame(query.data)
+    df = pd.DataFrame(res.data)
 
-    print("Raw rows fetched:", len(df))
+    print("Raw rows:", len(df))
 
     if df.empty:
         return df, latest_date
 
-    # ===== FILTER =====
+    # 🔥 RELAXED FILTER (do not over-filter here)
     df = df[
         (df["close"] > df["sma50"]) &
-        (df["sma50"] > df["sma200"]) &
-        (df["pct_from_high"] >= -15) &
-        (df["volume_ma20"] > 50000)
+        (df["volume_ma20"] > 20000)
     ]
 
     print("Filtered universe:", len(df))
@@ -94,14 +87,14 @@ def fetch_price_data(ticker, latest_date):
         datetime.strptime(latest_date, "%Y-%m-%d") - timedelta(days=LOOKBACK_DAYS)
     ).date().isoformat()
 
-    query = supabase.table("stock_prices_daily") \
+    res = supabase.table("stock_prices_daily") \
         .select("*") \
         .eq("ticker", ticker) \
         .gte("date", start_date) \
         .order("date") \
         .execute()
 
-    df = pd.DataFrame(query.data)
+    df = pd.DataFrame(res.data)
 
     if df.empty or len(df) < 60:
         return None
@@ -110,7 +103,7 @@ def fetch_price_data(ticker, latest_date):
 
 
 # =========================
-# SWINGS
+# SWING DETECTION
 # =========================
 def find_swings(df, window=5):
     highs, lows = [], []
@@ -119,17 +112,17 @@ def find_swings(df, window=5):
         high = df["high"].iloc[i]
         low = df["low"].iloc[i]
 
-        if high == df["high"].iloc[i - window:i + window].max():
+        if high == df["high"].iloc[i-window:i+window].max():
             highs.append((i, high))
 
-        if low == df["low"].iloc[i - window:i + window].min():
+        if low == df["low"].iloc[i-window:i+window].min():
             lows.append((i, low))
 
     return highs, lows
 
 
 # =========================
-# CONTRACTIONS
+# CONTRACTION CALCULATION
 # =========================
 def calculate_contractions(highs, lows):
     drops = []
@@ -139,8 +132,8 @@ def calculate_contractions(highs, lows):
         low = lows[i][1]
 
         if high and high > 0:
-            drop_pct = ((high - low) / high) * 100
-            drops.append(round(drop_pct, 2))
+            drop = ((high - low) / high) * 100
+            drops.append(round(drop, 2))
 
     return drops
 
@@ -149,14 +142,11 @@ def calculate_contractions(highs, lows):
 # VALIDATE VCP
 # =========================
 def is_valid_vcp(drops):
-    if len(drops) < 3:
-        return False
-
-    return all(drops[i] > drops[i + 1] for i in range(len(drops) - 1))
+    return len(drops) >= 3 and all(drops[i] > drops[i+1] for i in range(len(drops)-1))
 
 
 # =========================
-# TIGHT RANGE
+# TIGHT RANGE CHECK
 # =========================
 def check_tight_range(df):
     recent = df.tail(10)
@@ -167,9 +157,7 @@ def check_tight_range(df):
     if not high or high == 0:
         return False
 
-    range_pct = ((high - low) / high) * 100
-
-    return range_pct < 8
+    return ((high - low) / high) * 100 < 8
 
 
 # =========================
@@ -205,9 +193,7 @@ def calculate_score(row, drops, valid_vcp, tight_range, volume_ratio):
 # PROCESS STOCK
 # =========================
 def process_stock(row, latest_date):
-    ticker = row["ticker"]
-
-    df = fetch_price_data(ticker, latest_date)
+    df = fetch_price_data(row["ticker"], latest_date)
     if df is None:
         return None
 
@@ -215,48 +201,48 @@ def process_stock(row, latest_date):
     drops = calculate_contractions(highs, lows)
 
     valid_vcp = is_valid_vcp(drops)
-    tight_range = check_tight_range(df)
+    if not valid_vcp:
+        return None  # key filter
 
-    # Safe volume ratio
+    tight = check_tight_range(df)
+
+    # safe volume ratio
     if row["volume_ma20"] and row["volume_ma20"] > 0:
-        volume_ratio = row["volume"] / row["volume_ma20"]
+        vol_ratio = row["volume"] / row["volume_ma20"]
     else:
-        volume_ratio = 1
+        vol_ratio = 1
 
-    near_pivot = row["pct_from_high"] >= -10
+    score = calculate_score(row, drops, valid_vcp, tight, vol_ratio)
 
-    breakout_level = df["high"].tail(20).max()
+    if score < 60:
+        return None  # final filter
 
-    score = calculate_score(row, drops, valid_vcp, tight_range, volume_ratio)
+    category = "IDEAL" if score >= 80 else "DEVELOPING"
 
     return sanitize_record({
         "date": latest_date,
-        "ticker": ticker,
+        "ticker": row["ticker"],
         "exchange": row["exchange"],
-
         "vcp_score": int(score),
         "contractions": len(drops),
         "contraction_pattern": " → ".join([f"{d}%" for d in drops[:4]]),
-
         "pct_from_high": row["pct_from_high"],
         "base_depth": row["pct_from_low"],
-
-        "volume_ratio": round(volume_ratio, 2),
-        "volume_dryup": volume_ratio < 0.6,
-
-        "tight_range": tight_range,
-        "near_pivot": near_pivot,
-
-        "breakout_level": breakout_level
+        "volume_ratio": round(vol_ratio, 2),
+        "volume_dryup": vol_ratio < 0.6,
+        "tight_range": tight,
+        "near_pivot": row["pct_from_high"] >= -10,
+        "breakout_level": df["high"].tail(20).max(),
+        "category": category
     })
 
 
 # =========================
-# UPSERT
+# UPSERT RESULTS
 # =========================
 def upsert_results(results):
     if not results:
-        print("No results to store.")
+        print("No VCP candidates found.")
         return
 
     supabase.table("vcp_candidates").upsert(results).execute()
@@ -264,7 +250,7 @@ def upsert_results(results):
 
 
 # =========================
-# MAIN
+# MAIN RUNNER
 # =========================
 def run_vcp_engine():
     print("Fetching universe...")
@@ -272,12 +258,12 @@ def run_vcp_engine():
     universe, latest_date = fetch_universe()
 
     if universe.empty:
-        print("No stocks found after filtering.")
+        print("No stocks after filtering.")
         return
 
-    results = []
-
     print(f"Processing {len(universe)} stocks...")
+
+    results = []
 
     for _, row in universe.iterrows():
         try:
@@ -293,7 +279,7 @@ def run_vcp_engine():
 
 
 # =========================
-# ENTRY
+# ENTRY POINT
 # =========================
 if __name__ == "__main__":
     try:
