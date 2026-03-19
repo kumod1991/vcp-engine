@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+import math
 from datetime import datetime, timedelta
 from supabase import create_client
 
@@ -15,7 +16,25 @@ LOOKBACK_DAYS = 150
 
 
 # =========================
-# GET LATEST AVAILABLE DATE
+# CLEAN VALUE (JSON SAFE)
+# =========================
+def clean_value(val):
+    if val is None:
+        return None
+
+    if isinstance(val, float):
+        if math.isnan(val) or math.isinf(val):
+            return None
+
+    return val
+
+
+def sanitize_record(record):
+    return {k: clean_value(v) for k, v in record.items()}
+
+
+# =========================
+# GET LATEST DATE
 # =========================
 def get_latest_date():
     res = supabase.table("stock_52w") \
@@ -54,7 +73,7 @@ def fetch_universe():
     if df.empty:
         return df, latest_date
 
-    # ===== FILTER (balanced) =====
+    # ===== FILTER =====
     df = df[
         (df["close"] > df["sma50"]) &
         (df["sma50"] > df["sma200"]) &
@@ -91,7 +110,7 @@ def fetch_price_data(ticker, latest_date):
 
 
 # =========================
-# SWING DETECTION
+# SWINGS
 # =========================
 def find_swings(df, window=5):
     highs, lows = [], []
@@ -119,7 +138,7 @@ def calculate_contractions(highs, lows):
         high = highs[i][1]
         low = lows[i][1]
 
-        if high > 0:
+        if high and high > 0:
             drop_pct = ((high - low) / high) * 100
             drops.append(round(drop_pct, 2))
 
@@ -145,7 +164,7 @@ def check_tight_range(df):
     high = recent["high"].max()
     low = recent["low"].min()
 
-    if high == 0:
+    if not high or high == 0:
         return False
 
     range_pct = ((high - low) / high) * 100
@@ -198,7 +217,11 @@ def process_stock(row, latest_date):
     valid_vcp = is_valid_vcp(drops)
     tight_range = check_tight_range(df)
 
-    volume_ratio = row["volume"] / row["volume_ma20"] if row["volume_ma20"] else 1
+    # Safe volume ratio
+    if row["volume_ma20"] and row["volume_ma20"] > 0:
+        volume_ratio = row["volume"] / row["volume_ma20"]
+    else:
+        volume_ratio = 1
 
     near_pivot = row["pct_from_high"] >= -10
 
@@ -206,7 +229,7 @@ def process_stock(row, latest_date):
 
     score = calculate_score(row, drops, valid_vcp, tight_range, volume_ratio)
 
-    return {
+    return sanitize_record({
         "date": latest_date,
         "ticker": ticker,
         "exchange": row["exchange"],
@@ -225,7 +248,7 @@ def process_stock(row, latest_date):
         "near_pivot": near_pivot,
 
         "breakout_level": breakout_level
-    }
+    })
 
 
 # =========================
