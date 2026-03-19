@@ -18,7 +18,7 @@ PROCESS_WINDOW = 80
 
 
 # =========================
-# SANITIZE (CRITICAL FIX)
+# SANITIZE (CRITICAL)
 # =========================
 def clean(v):
     if v is None:
@@ -79,7 +79,7 @@ def get_latest_date():
 
 
 # =========================
-# FETCH PRICE DATA (BATCHED)
+# FETCH PRICE DATA
 # =========================
 def fetch_price_data(tickers, latest_date):
     start_date = (
@@ -144,8 +144,16 @@ def contractions(highs, lows):
     return drops
 
 
+# =========================
+# RELAXED VCP LOGIC (KEY FIX)
+# =========================
 def valid_vcp(drops):
-    return len(drops) >= 3 and all(drops[i] > drops[i+1] for i in range(len(drops)-1))
+    if len(drops) < 2:
+        return False
+
+    improving = sum(drops[i] > drops[i+1] for i in range(len(drops)-1))
+
+    return improving >= (len(drops) - 2)
 
 
 def tight_range(df):
@@ -155,7 +163,7 @@ def tight_range(df):
 
 
 # =========================
-# SCORE
+# SCORE (RELAXED)
 # =========================
 def score(row, drops, tight, vol_ratio):
     s = 0
@@ -167,8 +175,10 @@ def score(row, drops, tight, vol_ratio):
         s += 20
     elif row["pct_from_high"] >= -10:
         s += 15
+    elif row["pct_from_high"] >= -20:
+        s += 10
 
-    s += 25  # valid VCP
+    s += 30  # VCP weight increased
 
     if vol_ratio < 0.6:
         s += 15
@@ -218,8 +228,8 @@ def run():
         if ticker not in grouped:
             continue
 
-        # EARLY FILTERS (performance boost)
-        if row["pct_from_high"] is None or row["pct_from_high"] < -15:
+        # RELAXED EARLY FILTER
+        if row["pct_from_high"] is None or row["pct_from_high"] < -25:
             continue
 
         if not (row["close"] and row["sma50"] and row["close"] > row["sma50"]):
@@ -246,7 +256,7 @@ def run():
 
         s = score(row, drops, tight, vol_ratio)
 
-        if s < 50:
+        if s < 40:
             continue
 
         results.append(sanitize({
