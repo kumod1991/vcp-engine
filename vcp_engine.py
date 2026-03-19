@@ -4,16 +4,20 @@ import math
 from datetime import datetime, timedelta
 from supabase import create_client
 
+# =========================
+# CONFIG
+# =========================
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-LOOKBACK_DAYS = 150
+LOOKBACK_DAYS = 120   # reduced
+PROCESS_WINDOW = 80   # core optimization
 
 
 # =========================
-# CLEAN VALUE
+# CLEAN VALUES
 # =========================
 def clean(v):
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
@@ -44,7 +48,7 @@ def fetch_universe():
         offset += limit
 
     df = pd.DataFrame(all_rows)
-    print("Universe:", len(df))
+    print("Universe size:", len(df))
     return df
 
 
@@ -60,34 +64,33 @@ def get_latest_date():
 
 
 # =========================
-# FETCH ALL PRICE DATA (KEY OPTIMIZATION)
+# FETCH FILTERED PRICE DATA
 # =========================
-def fetch_all_price_data(latest_date):
+def fetch_price_data(tickers, latest_date):
     start_date = (
         datetime.strptime(latest_date, "%Y-%m-%d") - timedelta(days=LOOKBACK_DAYS)
     ).date().isoformat()
 
-    print("Fetching bulk price data...")
+    all_rows = []
+    batch_size = 200
 
-    all_rows, offset, limit = [], 0, 1000
+    print("Fetching price data...")
 
-    while True:
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+
         res = supabase.table("stock_prices_daily") \
             .select("ticker,date,high,low,close,volume") \
+            .in_("ticker", batch) \
             .gte("date", start_date) \
-            .range(offset, offset + limit - 1) \
             .execute()
 
-        if not res.data:
-            break
-
-        all_rows.extend(res.data)
-        offset += limit
+        if res.data:
+            all_rows.extend(res.data)
 
     df = pd.DataFrame(all_rows)
 
-    print("Total price rows:", len(df))
-
+    print("Price rows:", len(df))
     return df
 
 
@@ -115,11 +118,14 @@ def find_swings(df, window=5):
 # =========================
 def contractions(highs, lows):
     drops = []
+
     for i in range(min(len(highs), len(lows)) - 1):
         h = highs[i][1]
         l = lows[i][1]
+
         if h > 0:
             drops.append(round((h - l) / h * 100, 2))
+
     return drops
 
 
@@ -147,7 +153,7 @@ def score(row, drops, tight, vol_ratio):
     elif row["pct_from_high"] >= -10:
         s += 15
 
-    s += 25
+    s += 25  # valid VCP
 
     if vol_ratio < 0.6:
         s += 15
@@ -165,17 +171,32 @@ def score(row, drops, tight, vol_ratio):
 # MAIN ENGINE
 # =========================
 def run():
+    print("Fetching universe...")
     universe = fetch_universe()
+
+    if universe.empty:
+        print("No stocks found")
+        return
+
     latest_date = get_latest_date()
+    print("Using date:", latest_date)
 
-    price_df = fetch_all_price_data(latest_date)
+    tickers = universe["ticker"].dropna().unique().tolist()
 
-    # GROUP DATA ONCE
-    grouped = {k: v.sort_values("date") for k, v in price_df.groupby("ticker")}
+    price_df = fetch_price_data(tickers, latest_date)
+
+    if price_df.empty:
+        print("No price data")
+        return
+
+    # SORT ONCE (IMPORTANT)
+    price_df = price_df.sort_values(["ticker", "date"])
+
+    grouped = dict(tuple(price_df.groupby("ticker")))
 
     results = []
 
-    print("Processing...")
+    print("Processing stocks...")
 
     for _, row in universe.iterrows():
         ticker = row["ticker"]
@@ -183,10 +204,14 @@ def run():
         if ticker not in grouped:
             continue
 
+        # 🔥 EARLY FILTERS (BIG SPEED WIN)
+        if row["pct_from_high"] is None or row["pct_from_high"] < -15:
+            continue
+
         if not (row["close"] and row["sma50"] and row["close"] > row["sma50"]):
             continue
 
-        df = grouped[ticker]
+        df = grouped[ticker].tail(PROCESS_WINDOW)
 
         if len(df) < 60:
             continue
@@ -230,6 +255,7 @@ def run():
         supabase.table("vcp_candidates").upsert(results).execute()
 
     print(f"Stored {len(results)} results")
+    print("VCP Engine completed.")
 
 
 # =========================
