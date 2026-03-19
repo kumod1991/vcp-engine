@@ -1,4 +1,4 @@
-# 📊 VCP Screener Engine (TradeEdge)
+# 📊 VCP Screener Engine
 
 A production-grade **Volatility Contraction Pattern (VCP) detection engine** built for Indian equities, inspired by Mark Minervini’s methodology.
 
@@ -103,8 +103,8 @@ CREATE TABLE vcp_candidates (
 ### 1. Clone Repository
 
 ```
-git clone https://github.com/<your-username>/tradeedge-vcp-engine.git
-cd tradeedge-vcp-engine
+git clone https://github.com/<your-username>/vcp-engine.git
+cd vcp-engine
 ```
 
 ---
@@ -215,12 +215,6 @@ Breakout Level: ₹523
 * Supabase (Postgres)
 * GitHub Actions (cron automation)
 * React (frontend UI)
-
----
-
-## 🤝 Contribution
-
-This is part of the **TradeEdge** ecosystem. Contributions and enhancements are welcome.
 
 ---
 
