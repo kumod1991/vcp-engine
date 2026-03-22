@@ -1,66 +1,46 @@
 import os
 import pandas as pd
-import math
 import numpy as np
+import math
 from datetime import datetime, timedelta
 from supabase import create_client
 
-# =========================
-# CONFIG
-# =========================
+# ================= CONFIG =================
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-LOOKBACK_DAYS = 150
-PROCESS_WINDOW = 100
+LOOKBACK_DAYS = 180
+PROCESS_WINDOW = 120
 
 
-# =========================
-# SANITIZE
-# =========================
+# ================= HELPERS =================
 def clean(v):
     if v is None:
         return None
-    if isinstance(v, float):
-        if math.isnan(v) or math.isinf(v):
-            return None
-    if isinstance(v, np.bool_):
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    if isinstance(v, (np.bool_,)):
         return bool(v)
-    if isinstance(v, np.integer):
+    if isinstance(v, (np.integer,)):
         return int(v)
-    if isinstance(v, np.floating):
+    if isinstance(v, (np.floating,)):
         return float(v)
     return v
+
 
 def sanitize(d):
     return {k: clean(v) for k, v in d.items()}
 
 
-# =========================
-# FETCH UNIVERSE
-# =========================
+# ================= FETCH =================
 def fetch_universe():
-    all_rows, offset, limit = [], 0, 1000
-    while True:
-        res = supabase.table("stock_52w") \
-            .select("*") \
-            .range(offset, offset + limit - 1) \
-            .execute()
-        if not res.data:
-            break
-        all_rows.extend(res.data)
-        offset += limit
-
-    df = pd.DataFrame(all_rows)
-    print("Universe size:", len(df))
+    res = supabase.table("stock_52w").select("*").execute()
+    df = pd.DataFrame(res.data)
     return df
 
 
-# =========================
-# GET LATEST DATE
-# =========================
 def get_latest_date():
     return supabase.table("stock_prices_daily") \
         .select("date") \
@@ -69,67 +49,58 @@ def get_latest_date():
         .execute().data[0]["date"]
 
 
-# =========================
-# FETCH PRICE DATA
-# =========================
 def fetch_price_data(tickers, latest_date):
-    start_date = (
+    start = (
         datetime.strptime(latest_date, "%Y-%m-%d") - timedelta(days=LOOKBACK_DAYS)
     ).date().isoformat()
 
-    all_rows = []
-    batch_size = 200
+    res = supabase.table("stock_prices_daily") \
+        .select("ticker,date,high,low,close,volume") \
+        .in_("ticker", tickers) \
+        .gte("date", start) \
+        .execute()
 
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
-
-        res = supabase.table("stock_prices_daily") \
-            .select("ticker,date,high,low,close,volume") \
-            .in_("ticker", batch) \
-            .gte("date", start_date) \
-            .execute()
-
-        if res.data:
-            all_rows.extend(res.data)
-
-    df = pd.DataFrame(all_rows)
-    print("Price rows:", len(df))
+    df = pd.DataFrame(res.data)
     return df
 
 
-# =========================
-# CORE LOGIC
-# =========================
+def fetch_indicators():
+    res = supabase.table("indicators") \
+        .select("ticker,exchange,sma50,sma150,sma200,rs_rating") \
+        .execute()
+
+    return pd.DataFrame(res.data)
+
+
+# ================= CORE LOGIC =================
 
 def prior_uptrend(df):
     if len(df) < 100:
         return False
-    past = df.iloc[-100:-50]
-    recent = df.iloc[-50:]
-    return recent["close"].mean() > past["close"].mean() * 1.2
-
-
-def base_near_high(row):
-    return row["pct_from_high"] >= -15
+    return df["close"].iloc[-50:].mean() > df["close"].iloc[-100:-50].mean() * 1.2
 
 
 def ma_alignment(row):
-    return (
-        row["close"] > row["sma50"] > row["sma150"] > row["sma200"]
-    )
+    return row["close"] > row["sma50"] > row["sma150"] > row["sma200"]
 
 
-def find_swings(df, window=5):
+def find_swings(df, window=5, threshold=0.03):
     highs, lows = [], []
+
     for i in range(window, len(df) - window):
         h = df["high"].iloc[i]
         l = df["low"].iloc[i]
 
-        if h == df["high"].iloc[i-window:i+window].max():
-            highs.append((i, h))
+        local_high = df["high"].iloc[i-window:i+window].max()
+        local_low = df["low"].iloc[i-window:i+window].min()
 
-        if l == df["low"].iloc[i-window:i+window].min():
-            lows.append((i, l))
+        if h == local_high:
+            if not highs or abs(h - highs[-1][1]) / highs[-1][1] > threshold:
+                highs.append((i, h))
+
+        if l == local_low:
+            if not lows or abs(l - lows[-1][1]) / lows[-1][1] > threshold:
+                lows.append((i, l))
 
     return highs, lows
 
@@ -140,7 +111,7 @@ def contractions(highs, lows):
         h = highs[i][1]
         l = lows[i][1]
         if h > 0:
-            drops.append(round((h - l) / h * 100, 2))
+            drops.append((h - l) / h * 100)
     return drops
 
 
@@ -148,72 +119,73 @@ def valid_vcp(drops):
     if len(drops) < 3:
         return False
 
-    improving = all(drops[i] > drops[i+1] for i in range(len(drops)-1))
-
-    if not improving:
-        violations = sum(drops[i] <= drops[i+1] for i in range(len(drops)-1))
-        if violations > 1:
-            return False
-
-    if drops[0] < 8:
+    if not (drops[0] > drops[1] > drops[2]):
         return False
 
-    if drops[-1] > 12:
+    if drops[0] < 10:
+        return False
+
+    if drops[-1] > 10:
         return False
 
     return True
 
 
 def volume_dryup(df):
-    recent = df.tail(10)
-    avg_recent = recent["volume"].mean()
-    avg_prior = df.tail(40).head(30)["volume"].mean()
-
-    return avg_recent < avg_prior * 0.7
+    recent = df.tail(10)["volume"].mean()
+    prior = df.tail(40).head(30)["volume"].mean()
+    return recent < prior * 0.7
 
 
-def tight_pivot(df):
-    recent = df.tail(5)
-    high = recent["high"].max()
-    low = recent["low"].min()
-    return (high - low) / high * 100 < 5
+def breakout_volume(df):
+    return df["volume"].iloc[-1] > df["volume"].tail(20).mean() * 1.5
+
+
+def pivot_high(df):
+    return df["high"].tail(20).max()
+
+
+def near_pivot(df):
+    p = pivot_high(df)
+    return df["close"].iloc[-1] >= p * 0.97
+
+
+def tight_range(df):
+    r = df.tail(5)
+    return (r["high"].max() - r["low"].min()) / r["high"].max() < 0.05
 
 
 def score(row, drops):
     s = 50
     s += max(0, 20 - drops[-1])
-
     if row["pct_from_high"] >= -5:
         s += 10
-
-    if row["pct_from_low"] > 60:
+    if row["pct_from_low"] > 50:
         s += 10
-
+    if row["rs_rating"] >= 90:
+        s += 10
     return min(s, 100)
 
 
-# =========================
-# MAIN ENGINE
-# =========================
-def run():
-    print("Fetching universe...")
-    universe = fetch_universe()
+# ================= ENGINE =================
 
+def run():
+    universe = fetch_universe()
     if universe.empty:
         return
 
     latest_date = get_latest_date()
-    print("Using date:", latest_date)
 
     tickers = universe["ticker"].dropna().unique().tolist()
     price_df = fetch_price_data(tickers, latest_date)
+    ind_df = fetch_indicators()
 
     price_df = price_df.sort_values(["ticker", "date"])
     grouped = dict(tuple(price_df.groupby("ticker")))
 
-    results = []
+    universe = universe.merge(ind_df, on=["ticker", "exchange"], how="left")
 
-    print("Processing stocks...")
+    results = []
 
     for _, row in universe.iterrows():
         ticker = row["ticker"]
@@ -228,11 +200,14 @@ def run():
 
         df = df_full.tail(PROCESS_WINDOW)
 
-        # --- Filters ---
+        # Filters
+        if row["rs_rating"] < 80:
+            continue
+
         if not prior_uptrend(df_full):
             continue
 
-        if not base_near_high(row):
+        if row["pct_from_high"] < -15:
             continue
 
         if not ma_alignment(row):
@@ -247,8 +222,22 @@ def run():
         if not volume_dryup(df):
             continue
 
-        if not tight_pivot(df):
+        if not tight_range(df):
             continue
+
+        pivot = pivot_high(df)
+        close = df["close"].iloc[-1]
+
+        status = "VCP"
+
+        if near_pivot(df):
+            status = "NEAR_PIVOT"
+
+        if breakout_volume(df):
+            status = "BREAKOUT_READY"
+
+        if close > pivot:
+            status = "BREAKOUT_CONFIRMED"
 
         s = score(row, drops)
 
@@ -256,33 +245,23 @@ def run():
             "ticker": ticker,
             "exchange": row["exchange"],
             "vcp_score": int(s),
-            "category": "IDEAL",
-            "contractions": int(len(drops)),
-            "contraction_pattern": " → ".join([f"{d}%" for d in drops[:4]]),
+            "stage": status,
+            "contractions": len(drops),
+            "pattern": " → ".join([f"{round(d,1)}%" for d in drops[:4]]),
+            "pivot": float(pivot),
             "pct_from_high": float(row["pct_from_high"]),
-            "base_depth": float(row["pct_from_low"]),
-            "volume_dryup": True,
-            "tight_range": True,
-            "near_pivot": True,
-            "breakout_level": float(df["high"].tail(20).max()),
+            "rs_rating": int(row["rs_rating"]),
             "detected_at": datetime.utcnow().isoformat()
         }))
 
-    # =========================
-    # SNAPSHOT OVERWRITE
-    # =========================
-    print("Clearing previous VCP data...")
+    # overwrite table
     supabase.table("vcp_candidates").delete().neq("ticker", "").execute()
 
     if results:
         supabase.table("vcp_candidates").insert(results).execute()
 
-    print(f"Stored {len(results)} results")
-    print("VCP Engine completed.")
+    print(f"Stored {len(results)} VCP candidates")
 
 
-# =========================
-# ENTRY
-# =========================
 if __name__ == "__main__":
     run()
